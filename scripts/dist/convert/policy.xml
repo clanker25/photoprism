@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policymap [
+  <!ELEMENT policymap (policy)*>
+  <!ATTLIST policymap xmlns CDATA #FIXED ''>
+  <!ELEMENT policy EMPTY>
+  <!ATTLIST policy xmlns CDATA #FIXED '' domain NMTOKEN #REQUIRED
+    name NMTOKEN #IMPLIED pattern CDATA #IMPLIED rights NMTOKEN #IMPLIED
+    stealth NMTOKEN #IMPLIED value CDATA #IMPLIED>
+]>
+<!--
+  ImageMagick security policy for PhotoPrism base images.
+
+  Domains are system, delegate, coder, module, filter, path, or resource. Rights are
+  none, read, write, execute, and all, combined with "|". Patterns are glob expressions
+  and may use braces to list alternatives, for example "{GIF,JPEG,PNG}".
+
+  Names must match what ImageMagick registers, which is not always the format name a
+  user types. Verify a rule before trusting it:
+
+    magick -list policy      shows the rules that were loaded
+    magick -list format      shows coder names and the module that provides them
+    magick -list delegate    shows delegate names, e.g. "https:decode", not "HTTPS"
+
+  A rule whose pattern matches nothing is silently ignored, so an ineffective rule
+  looks exactly like an enforced one in "-list policy".
+-->
+<policymap>
+  <!--
+    Pixel cache limits.
+
+    PhotoPrism caps source resolution itself via PHOTOPRISM_RESOLUTION_LIMIT (default
+    150 MP, max 900), so these values only need to stay clear of that limit rather than
+    enforce a second, non-configurable one of their own.
+
+    A Q16 build holds 8 bytes per pixel, so memory + map is worth about 335 MP: "area"
+    sits just below it, and images up to the area threshold are served without touching
+    the slower disk tier. Larger images spill to a temporary file bounded by "disk",
+    which needs 10GiB to convert a 900 MP source and is set above that for headroom.
+    Sizing it this way keeps the policy from ever being the binding constraint, so
+    PHOTOPRISM_RESOLUTION_LIMIT stays the only limit an operator has to think about.
+    Lowering "disk" reintroduces a ceiling that surfaces as "cache resources exhausted".
+
+    "width" and "height" are a cheap guard against a decompression bomb that declares
+    absurd dimensions in its header, not a resolution policy. 32KP stays above the
+    30000 pixel ceiling of PHOTOPRISM_JPEG_SIZE and PHOTOPRISM_PNG_SIZE so nothing
+    PhotoPrism can produce is rejected on the way in. A 900 MP source is covered up to
+    30000x30000; beyond that aspect ratio the dimension guard bites before "disk" does.
+  -->
+  <policy domain="resource" name="memory" value="512MiB"/>
+  <policy domain="resource" name="map" value="2GiB"/>
+  <policy domain="resource" name="area" value="256MP"/>
+  <policy domain="resource" name="disk" value="12GiB"/>
+  <policy domain="resource" name="width" value="32KP"/>
+  <policy domain="resource" name="height" value="32KP"/>
+
+  <!--
+    Deny ImageMagick its own network access, so crafted input cannot turn an indexing
+    run into an outbound request. The coders are named HTTP, HTTPS, and FTP and are all
+    provided by the URL module; the delegates that shell out to curl are named
+    "http:decode" and "https:decode". A pattern of "HTTP" in the delegate domain matches
+    no delegate and leaves curl reachable, so the coder and module rules below are the
+    ones that enforce this. The delegate rules are kept as a second layer.
+  -->
+  <policy domain="module" rights="none" pattern="URL"/>
+  <policy domain="coder" rights="none" pattern="{HTTP,HTTPS,FTP}"/>
+  <policy domain="delegate" rights="none" pattern="{URL,HTTP,HTTPS,http:decode,https:decode}"/>
+
+  <!--
+    Disable coders that execute scripts, read arbitrary local files into an image, or
+    expect an interactive session. None of them are reachable through a PhotoPrism
+    conversion command, which always passes a real file path.
+
+    MVG and MSVG must stay enabled: SVG rendering is routed through them, and blocking
+    either one breaks vector previews. PDF, PS, EPS, and AI also stay enabled, since
+    document and vector previews rasterize through the Ghostscript delegate.
+  -->
+  <policy domain="coder" rights="none" pattern="{MSL,TEXT,SHOW,WIN,PLT,VID,EPHEMERAL,CLIPBOARD,X,XPS}"/>
+
+  <!-- Indirect reads are not permitted, so an "@file" argument cannot pull in a file list. -->
+  <policy domain="path" rights="none" pattern="@*"/>
+</policymap>

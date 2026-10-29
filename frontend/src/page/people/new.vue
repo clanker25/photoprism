@@ -1,0 +1,832 @@
+<template>
+  <div class="p-page p-page-faces not-selectable">
+    <v-form ref="form" validate-on="invalid-input" class="p-faces-search" @submit.prevent="updateQuery">
+      <v-toolbar density="compact" class="page-toolbar" color="secondary-light">
+        <v-spacer></v-spacer>
+
+        <v-btn :title="$gettext('Refresh')" icon="mdi-refresh" class="action-reload" @click.stop="refresh"> </v-btn>
+
+        <v-btn v-if="!filter.hidden" :title="$gettext('Show hidden')" icon="mdi-eye" class="action-show-hidden" @click.stop="onShowHidden"> </v-btn>
+        <v-btn v-else :title="$gettext('Exclude hidden')" icon="mdi-eye-off" class="action-exclude-hidden" @click.stop="onExcludeHidden"> </v-btn>
+      </v-toolbar>
+    </v-form>
+
+    <div v-if="loading" class="p-page__loading">
+      <p-loading></p-loading>
+    </div>
+    <div v-else class="p-page__content">
+      <p-scroll :load-more="loadMore" :load-disabled="scrollDisabled" :load-distance="scrollDistance" :loading="loading"></p-scroll>
+
+      <div v-if="results.length === 0" class="pa-3">
+        <v-alert color="primary" icon="mdi-check-circle-outline" class="no-results" variant="outlined">
+          <div class="font-weight-bold">
+            {{ $gettext(`No people found`) }}
+          </div>
+          <div class="mt-2">
+            {{ $gettext(`You may rescan your library to find additional faces.`) }}
+            {{ $gettext(`Recognition starts after indexing has been completed.`) }}
+          </div>
+        </v-alert>
+        <div class="d-flex justify-center my-8">
+          <v-btn color="button" rounded variant="flat" :to="{ name: 'all', query: { q: 'face:new' } }">
+            {{ $gettext(`Show all new faces`) }}
+          </v-btn>
+        </div>
+      </div>
+      <div v-else>
+        <div class="v-row search-results face-results cards-view" :class="{ 'select-results': selection.length > 0 }">
+          <div v-for="m in results" :key="m.ID" class="v-col-12 v-col-sm-6 v-col-md-4 v-col-lg-3 v-col-xl-2">
+            <div :data-id="m.ID" :class="m.classes()" class="result flex-grow-1 not-selectable">
+              <v-img :src="m.thumbnailUrl('tile_320')" aspect-ratio="1" class="preview" @click.stop.prevent="onView(m)">
+                <v-btn :ripple="false" class="input-hidden" icon variant="text" density="comfortable" position="absolute" @click.stop.prevent="toggleHidden(m)">
+                  <v-icon color="white" class="select-on" :title="$gettext('Show')">mdi-eye-off</v-icon>
+                  <v-icon color="white" class="select-off" :title="$gettext('Hide')">mdi-close</v-icon>
+                </v-btn>
+              </v-img>
+
+              <v-card-actions class="meta pa-0">
+                <v-text-field
+                  v-if="m.SubjUID"
+                  v-model="m.Name"
+                  :rules="rules.text(true, 0, SubjectMaxLength.Name, $gettext('Name'))"
+                  :readonly="readonly"
+                  autocomplete="off"
+                  single-line
+                  density="comfortable"
+                  class="input-name pa-0 ma-0"
+                  @blur="() => onSetName(m)"
+                  @keyup.enter="() => onSetName(m)"
+                ></v-text-field>
+                <v-combobox
+                  v-else
+                  :items="focused === m.ID ? people : noPeople"
+                  item-title="Name"
+                  item-value="Name"
+                  :readonly="readonly"
+                  :menu-props="menuProps"
+                  :menu-icon="null"
+                  return-object
+                  hide-no-data
+                  hide-details
+                  single-line
+                  open-on-clear
+                  append-icon=""
+                  prepend-inner-icon="mdi-account-plus"
+                  autocomplete="off"
+                  density="comfortable"
+                  class="input-name pa-0 ma-0 text-selectable"
+                  @focus="() => onFocusName(m)"
+                  @update:search="(value) => onNameInput(m, value)"
+                  @update:model-value="(value) => onSelectPerson(m, value)"
+                  @blur="() => onBlurName(m)"
+                  @keyup.enter="() => onSubmitName(m)"
+                >
+                </v-combobox>
+              </v-card-actions>
+            </div>
+          </div>
+        </div>
+        <div class="d-flex justify-center my-8">
+          <v-btn color="button" rounded variant="flat" :to="{ name: 'all', query: { q: 'face:new' } }">
+            {{ $gettext(`Show all new faces`) }}
+          </v-btn>
+        </div>
+      </div>
+    </div>
+
+    <p-confirm-dialog
+      :visible="confirm.visible"
+      icon="mdi-account-plus"
+      :text="confirmText"
+      :action="$gettext('Confirm')"
+      :confirm-on-enter="false"
+      @close="onCancelCreatePerson"
+      @confirm="onConfirmCreatePerson"
+    ></p-confirm-dialog>
+  </div>
+</template>
+
+<script>
+import Face from "model/face";
+import RestModel from "model/rest";
+import { MaxLength as SubjectMaxLength } from "model/subject";
+import typeaheadCache from "common/typeahead-cache";
+import { rules } from "common/form";
+import { MaxItems } from "common/clipboard";
+import $notify from "common/notify";
+import { ClickLong, ClickShort, Input, InputInvalid } from "common/input";
+import { ACTION_CREATED, ACTION_UPDATED, ACTION_DELETED } from "common/event";
+import PLoading from "component/loading.vue";
+
+export default {
+  name: "PPageFaces",
+  components: {
+    PLoading,
+  },
+  props: {
+    staticFilter: {
+      type: Object,
+      default: () => {},
+    },
+    active: Boolean,
+  },
+  emits: ["updateFaceCount"],
+  data() {
+    const query = this.$route.query;
+    const routeName = this.$route.name;
+    const q = query["q"] ? query["q"] : "";
+    const hidden = query["hidden"] ? query["hidden"] : "";
+    const order = this.sortOrder();
+    const filter = { q, hidden, order };
+    const settings = {};
+
+    return {
+      view: "all",
+      config: this.$config.values,
+      people: [],
+      // Stable empty list handed to every combobox that is not being edited.
+      noPeople: [],
+      focused: "",
+      // Typed name per face id. Kept out of the model so a keystroke cannot become a saved name.
+      nameInput: {},
+      confirm: { visible: false, model: null, name: "" },
+      rules,
+      SubjectMaxLength,
+      subscriptions: [],
+      listen: false,
+      dirty: false,
+      results: [],
+      scrollDisabled: true,
+      scrollDistance: window.innerHeight * 2,
+      loading: true,
+      busy: false,
+      batchSize: 999,
+      offset: 0,
+      page: 0,
+      faceCount: 0,
+      selection: [],
+      settings: settings,
+      filter: filter,
+      lastFilter: {},
+      routeName: routeName,
+      input: new Input(),
+      lastId: "",
+      menuProps: {
+        openOnClick: false,
+        openOnFocus: true,
+        closeOnBack: true,
+        closeOnContentClick: true,
+        disableInitialFocus: true,
+        persistent: false,
+        scrim: true,
+        openDelay: 0,
+        closeDelay: 0,
+        opacity: 0,
+        density: "compact",
+        maxHeight: 300,
+        locationStrategy: "connected",
+        scrollStrategy: "reposition",
+        origin: "auto",
+      },
+    };
+  },
+  computed: {
+    readonly: function () {
+      return this.busy || this.loading;
+    },
+    confirmText: function () {
+      return this.$gettext("Add %{s}?", { s: this.$util.isolate(this.confirm.name) });
+    },
+  },
+  watch: {
+    $route() {
+      // Tab inactive?
+      if (!this.active) {
+        // Ignore event.
+        return;
+      }
+
+      const query = this.$route.query;
+
+      this.filter.q = query["q"] ? query["q"] : "";
+      this.filter.hidden = query["hidden"] ? query["hidden"] : "";
+      this.filter.order = this.sortOrder();
+      this.routeName = this.$route.name;
+
+      this.search();
+    },
+  },
+  created() {
+    this.search();
+    this.loadPeople();
+
+    // No code currently publishes faces.* events — neither the frontend ($event bus) nor
+    // the backend (and "faces" is not in the WebsocketTopics forward allowlist), so this
+    // subscription is dormant. If wired up, it must emit UID-only payloads and onUpdate's
+    // `updated` branch needs converting to a by-UID refetch (it still assumes a full entity).
+    this.subscriptions.push(this.$event.subscribe("faces", (ev, data) => this.onUpdate(ev, data)));
+    this.subscriptions.push(this.$event.subscribe("touchmove.top", () => this.refresh()));
+  },
+  beforeUnmount() {
+    for (let i = 0; i < this.subscriptions.length; i++) {
+      this.$event.unsubscribe(this.subscriptions[i]);
+    }
+  },
+  methods: {
+    // notifyResultCount announces how many rows the last search returned, and says nothing for the
+    // tab the user is not looking at. Both tabs are mounted eagerly and search when they are created,
+    // so the hidden one would otherwise report "No people found" over the list that is on screen.
+    notifyResultCount() {
+      if (!this.active) {
+        return;
+      }
+
+      if (!this.results.length) {
+        this.$notify.warn(this.$gettext("No people found"));
+      } else if (this.results.length === 1) {
+        this.$notify.info(this.$gettext("One person found"));
+      } else {
+        this.$notify.info(this.$gettext("%{n} people found", { n: this.results.length }));
+      }
+    },
+    // loadPeople populates the name suggestions from the shared people cache;
+    // a denied or failed fetch leaves the list empty rather than throwing.
+    loadPeople() {
+      return typeaheadCache
+        .getPeople()
+        .then((models) => {
+          this.people = Array.isArray(models) ? models : [];
+        })
+        .catch(() => {});
+    },
+    // onFocusName records which tile is being edited and loads the suggestions.
+    // Only that tile's combobox receives the list, so the item state stays
+    // proportional to the list length instead of list length times tile count.
+    // The id is kept after blur so a menu click cannot empty the list mid-select.
+    onFocusName(model) {
+      this.focused = model?.ID ? model.ID : "";
+      return this.loadPeople();
+    },
+    searchCount() {
+      return this.batchSize;
+    },
+    sortOrder() {
+      return "samples";
+    },
+    setOffset(offset) {
+      this.offset = offset;
+    },
+    toggleLike(ev, index) {
+      const inputType = this.input.eval(ev, index);
+
+      if (inputType !== ClickShort) {
+        return;
+      }
+
+      const m = this.results[index];
+
+      if (!m) {
+        return;
+      }
+
+      m.toggleLike();
+    },
+    selectRange(rangeEnd, models) {
+      if (!models || !models[rangeEnd] || !(models[rangeEnd] instanceof RestModel)) {
+        console.warn("selectRange() - invalid arguments:", rangeEnd, models);
+        return;
+      }
+
+      let rangeStart = models.findIndex((m) => m.getId() === this.lastId);
+
+      if (rangeStart === -1) {
+        this.toggleSelection(models[rangeEnd].getId());
+        return 1;
+      }
+
+      if (rangeStart > rangeEnd) {
+        const newEnd = rangeStart;
+        rangeStart = rangeEnd;
+        rangeEnd = newEnd;
+      }
+
+      for (let i = rangeStart; i <= rangeEnd; i++) {
+        this.addSelection(models[i].getId());
+      }
+
+      return rangeEnd - rangeStart + 1;
+    },
+    onSelect(ev, index) {
+      const inputType = this.input.eval(ev, index);
+
+      if (inputType !== ClickShort) {
+        return;
+      }
+
+      if (ev.shiftKey) {
+        this.selectRange(index, this.results);
+      } else {
+        this.toggleSelection(this.results[index].getId());
+      }
+    },
+    onClick(ev, index) {
+      const inputType = this.input.eval(ev, index);
+      const longClick = inputType === ClickLong;
+
+      if (inputType === InputInvalid) {
+        return;
+      }
+
+      if (longClick || this.selection.length > 0) {
+        if (longClick || ev.shiftKey) {
+          this.selectRange(index, this.results);
+        } else {
+          this.toggleSelection(this.results[index].getId());
+        }
+      } else {
+        this.$router.push(this.results[index].route(this.view));
+      }
+    },
+    onContextMenu(ev, index) {
+      if (this.$isMobile) {
+        ev.preventDefault();
+        ev.stopPropagation();
+
+        if (this.results[index]) {
+          this.selectRange(index, this.results);
+        }
+      }
+    },
+    onView(model) {
+      if (this.loading || this.busy || !this.active) {
+        // Don't redirect if page is not ready or active.
+        return;
+      }
+
+      this.$router.push(model.route(this.view));
+    },
+    onUpdate(ev, data) {
+      if (!this.listen) {
+        return;
+      }
+
+      if (!data || !data.entities || !Array.isArray(data.entities)) {
+        return;
+      }
+
+      const type = ev.split(".")[1];
+
+      switch (type) {
+        case ACTION_UPDATED:
+          for (let i = 0; i < data.entities.length; i++) {
+            const values = data.entities[i];
+            const model = this.results.find((m) => m.UID === values.UID);
+
+            if (model) {
+              for (let key in values) {
+                if (values.hasOwnProperty(key) && values[key] != null && typeof values[key] !== "object") {
+                  model[key] = values[key];
+                }
+              }
+            }
+          }
+          break;
+        case ACTION_DELETED:
+          this.dirty = true;
+
+          for (let i = 0; i < data.entities.length; i++) {
+            const uid = data.entities[i];
+            const index = this.results.findIndex((m) => m.UID === uid);
+
+            if (index >= 0) {
+              this.results.splice(index, 1);
+            }
+
+            this.removeSelection(uid);
+          }
+
+          break;
+        case ACTION_CREATED:
+          this.dirty = true;
+          break;
+        default:
+          console.warn("unexpected event type", ev);
+      }
+    },
+    onSave(m) {
+      m.update();
+    },
+    onShowHidden() {
+      this.showHidden("yes");
+    },
+    onExcludeHidden() {
+      this.showHidden("");
+    },
+    showHidden(value) {
+      this.filter.hidden = value;
+      this.updateQuery();
+    },
+    clearQuery() {
+      this.filter.q = "";
+      this.updateQuery();
+    },
+    addSelection(uid) {
+      const pos = this.selection.indexOf(uid);
+
+      if (pos === -1) {
+        if (this.selection.length >= MaxItems) {
+          $notify.warn(this.$gettext("Can't select more items"));
+          return;
+        }
+
+        this.selection.push(uid);
+        this.lastId = uid;
+      }
+    },
+    toggleSelection(uid) {
+      const pos = this.selection.indexOf(uid);
+
+      if (pos !== -1) {
+        this.selection.splice(pos, 1);
+        this.lastId = "";
+      } else {
+        if (this.selection.length >= MaxItems) {
+          $notify.warn(this.$gettext("Can't select more items"));
+          return;
+        }
+
+        this.selection.push(uid);
+        this.lastId = uid;
+      }
+    },
+    removeSelection(uid) {
+      const pos = this.selection.indexOf(uid);
+
+      if (pos !== -1) {
+        this.selection.splice(pos, 1);
+        this.lastId = "";
+      }
+    },
+    clearSelection() {
+      this.selection.splice(0, this.selection.length);
+      this.lastId = "";
+    },
+    loadMore() {
+      if (this.scrollDisabled || !this.active) {
+        return;
+      }
+
+      this.scrollDisabled = true;
+      this.listen = false;
+
+      // Always refresh all faces for now.
+      this.dirty = true;
+
+      const count = this.batchSize;
+      const offset = 0;
+
+      const params = {
+        count: count,
+        offset: offset,
+      };
+
+      Object.assign(params, this.lastFilter);
+
+      if (this.staticFilter) {
+        Object.assign(params, this.staticFilter);
+      }
+
+      Face.search(params)
+        .then((resp) => {
+          this.results = this.dirty ? resp.models : this.results.concat(resp.models);
+
+          this.setFaceCount(this.results.length);
+
+          this.notifyResultCount();
+        })
+        .catch(() => {
+          this.scrollDisabled = false;
+        })
+        .finally(() => {
+          this.dirty = false;
+          this.loading = false;
+          this.listen = true;
+        });
+    },
+    updateQuery() {
+      if (this.loading || !this.active) {
+        return false;
+      }
+
+      this.filter.q = this.filter.q.trim();
+
+      const query = {
+        view: this.settings.view,
+      };
+
+      Object.assign(query, this.filter);
+
+      for (let key in query) {
+        if (query[key] === undefined || !query[key]) {
+          delete query[key];
+        }
+      }
+
+      if (JSON.stringify(this.$route.query) === JSON.stringify(query)) {
+        return false;
+      }
+
+      this.$router.replace({ query: query });
+
+      return true;
+    },
+    searchParams() {
+      const params = {
+        count: this.searchCount(),
+        offset: this.offset,
+      };
+
+      Object.assign(params, this.filter);
+
+      if (this.staticFilter) {
+        Object.assign(params, this.staticFilter);
+      }
+
+      return params;
+    },
+    refresh() {
+      if (this.loading || !this.active || !this.listen || this.busy) {
+        return;
+      }
+
+      // Make sure enough results are loaded to maintain the scroll position.
+      if (this.page > 2) {
+        this.page = this.page - 1;
+      } else {
+        this.page = 1;
+      }
+
+      // Flag results as dirty to force a refresh.
+      this.dirty = true;
+
+      // Enable infinite scrolling if it was disabled.
+      this.scrollDisabled = false;
+
+      this.loadMore();
+    },
+    reset() {
+      this.results = [];
+    },
+    search() {
+      this.scrollDisabled = true;
+
+      // Don't query the same data more than once.
+      if (JSON.stringify(this.lastFilter) === JSON.stringify(this.filter)) {
+        this.refresh();
+        return;
+      }
+
+      Object.assign(this.lastFilter, this.filter);
+
+      this.offset = 0;
+      this.page = 0;
+      this.loading = true;
+      this.listen = false;
+
+      const params = this.searchParams();
+
+      Face.search(params)
+        .then((resp) => {
+          this.offset = resp.limit;
+          this.results = resp.models;
+
+          this.setFaceCount(this.results.length);
+
+          this.notifyResultCount();
+        })
+        .catch(() => {
+          this.reset();
+        })
+        .finally(() => {
+          this.dirty = false;
+          this.loading = false;
+          this.listen = true;
+        });
+    },
+    onShow(model) {
+      if (this.busy || !model) {
+        return;
+      }
+
+      this.busy = true;
+      model.show().finally(() => {
+        this.busy = false;
+        this.changeFaceCount(1);
+      });
+    },
+    onHide(model) {
+      if (this.busy || !model) {
+        return;
+      }
+
+      this.busy = true;
+      model.hide().finally(() => {
+        this.busy = false;
+        this.changeFaceCount(-1);
+      });
+    },
+    toggleHidden(model) {
+      if (this.busy || !model) {
+        return;
+      }
+
+      this.busy = true;
+
+      model.toggleHidden().finally(() => {
+        this.busy = false;
+
+        if (model.Hidden) {
+          this.changeFaceCount(-1);
+        } else {
+          this.changeFaceCount(1);
+        }
+      });
+    },
+    // onNameInput records what was typed without touching the model. The committed name and the
+    // search text are separate values: binding them together made every keystroke a saved name.
+    //
+    // Observed rather than bound, and the combobox keeps its own model too. Driving either from
+    // here puts a Vue render between the keystroke and the widget's state, which the suggestion
+    // filter reads - fast input then filters against a stale value.
+    onNameInput(model, value) {
+      if (!model?.ID) {
+        return;
+      }
+
+      this.nameInput[model.ID] = typeof value === "string" ? value : "";
+    },
+    // onSelectPerson commits a person chosen from the suggestion list.
+    //
+    // Free text reaches this event too - the combobox reports every keystroke through it, which is
+    // how v-model on a combobox yields the typed string live - and is ignored here, because typing
+    // is not a commit. Enter and blur are what submit it.
+    onSelectPerson(model, value) {
+      if (this.busy || !model?.ID) {
+        return;
+      }
+
+      if (value && typeof value === "object" && value.UID && value.Name) {
+        return this.commitPerson(model, value.Name, value.UID);
+      }
+    },
+    // onSubmitName commits the typed name, asking first when it names nobody.
+    //
+    // Enter is also the combobox's key for accepting a highlighted suggestion. That path commits
+    // through onSelectPerson on keydown and sets busy synchronously, so by the time this runs on
+    // keyup the selection has already won and the search text cannot be saved in its place.
+    onSubmitName(model) {
+      return this.resolveName(model, true);
+    },
+    // onBlurName commits the typed name only where it already names someone. Leaving a field is
+    // not intent, so an unknown name is neither saved nor thrown away: it stays in the field.
+    onBlurName(model) {
+      return this.resolveName(model, false);
+    },
+    // resolveName looks the typed name up and commits it, prompting for an unknown name only when
+    // the user submitted it. A mistyped name here is not a typo they can undo - it becomes a second
+    // identity, and the matcher then narrows both clusters to keep the two apart.
+    resolveName(model, prompt) {
+      if (this.busy || !model?.ID || model.SubjUID) {
+        return;
+      }
+
+      const name = (this.nameInput[model.ID] ? this.nameInput[model.ID] : "").trim();
+
+      if (name === "") {
+        return;
+      }
+
+      // Resolved through the cache rather than this.people, which is empty until the suggestions
+      // load - the window in which a typed name misses a person who does exist.
+      return typeaheadCache
+        .getPeople()
+        .then((people) => {
+          const found = Array.isArray(people) ? people.find((person) => person.Name && person.Name.localeCompare(name, "en", { sensitivity: "base" }) === 0) : null;
+
+          if (found) {
+            return this.commitPerson(model, found.Name, found.UID);
+          }
+
+          // Anything that named this face while the lookup was in flight settles it.
+          if (!prompt || this.busy || model.SubjUID) {
+            return;
+          }
+
+          this.confirm.model = model;
+          this.confirm.name = name;
+          this.confirm.visible = true;
+        })
+        .catch(() => {});
+    },
+    // commitPerson writes a name onto the model and saves it. The only path that does.
+    commitPerson(model, name, subjUID) {
+      if (!model || !name) {
+        return;
+      }
+
+      // Vuetify also commits free text when the field loses focus, so a click on a suggestion can
+      // raise the prompt for the half-typed text as well. Whichever lands first, the choice the
+      // user actually made wins and the prompt goes away.
+      if (this.confirm.visible && this.confirm.model === model) {
+        this.onCancelCreatePerson();
+      }
+
+      model.Name = name;
+      model.SubjUID = subjUID ? subjUID : "";
+
+      return this.setName(model, name);
+    },
+    onCancelCreatePerson() {
+      this.confirm.visible = false;
+      this.confirm.model = null;
+      this.confirm.name = "";
+    },
+    onConfirmCreatePerson() {
+      const model = this.confirm.model;
+      const name = this.confirm.name;
+
+      this.onCancelCreatePerson();
+
+      this.commitPerson(model, name, "");
+    },
+    onSetName(model) {
+      if (this.busy || !model) {
+        return;
+      }
+
+      const name = model?.Name;
+
+      if (!name) {
+        return;
+      }
+
+      const people = this.people;
+
+      if (Array.isArray(people)) {
+        const found = people.find((person) => person.Name && person.Name.localeCompare(name, "en", { sensitivity: "base" }) === 0);
+        if (found) {
+          model.Name = found.Name;
+          model.SubjUID = found.UID;
+          if (model.wasChanged()) {
+            this.setName(model, model.Name);
+          }
+          return;
+        }
+      }
+
+      model.Name = name;
+      model.SubjUID = "";
+
+      this.setName(model, model.Name);
+    },
+    setName(model, newName) {
+      const trimmed = (newName || "").trim();
+      if (this.busy || !model || trimmed === "") {
+        // Ignore if busy, refuse to save empty name.
+        return;
+      }
+
+      this.busy = true;
+      this.$notify.blockUI("busy");
+
+      // Face.setName() seeds the shared people cache, and the name combobox
+      // reloads suggestions on focus, so no explicit refresh is needed here.
+      return model
+        .setName(trimmed)
+        .then(() => {
+          // Acknowledged where it happens. The People views are eventually consistent - a new
+          // person stays off Recognized until subject counts are refreshed - so a user who reads
+          // that list for confirmation is told a name took effect minutes after it did.
+          if (model.ID) {
+            delete this.nameInput[model.ID];
+          }
+
+          this.$notify.success(this.$gettext("Changes successfully saved"));
+        })
+        .finally(() => {
+          this.$notify.unblockUI();
+          this.busy = false;
+          this.changeFaceCount(-1);
+        });
+    },
+    changeFaceCount(count) {
+      this.faceCount = this.faceCount + count;
+      this.$emit("updateFaceCount", this.faceCount);
+    },
+    setFaceCount(count) {
+      this.faceCount = count;
+      this.$emit("updateFaceCount", this.faceCount);
+    },
+  },
+};
+</script>

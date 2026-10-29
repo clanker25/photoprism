@@ -1,0 +1,145 @@
+package api
+
+import (
+	"fmt"
+	"net/http"
+	"path/filepath"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/pkg/clean"
+)
+
+// FoldersResponse represents the folders API response.
+type FoldersResponse struct {
+	Root      string          `json:"root,omitempty"`
+	Folders   []entity.Folder `json:"folders"`
+	Files     []entity.File   `json:"files,omitempty"`
+	Recursive bool            `json:"recursive,omitempty"`
+	Cached    bool            `json:"cached,omitempty"`
+}
+
+// SearchFoldersOriginals returns folders in originals as JSON.
+//
+//	@Summary	list folders in originals
+//	@Id			SearchFoldersOriginals
+//	@Tags		Folders
+//	@Produce	json
+//	@Success	200		{object}	api.FoldersResponse
+//	@Failure	401,403	{object}	i18n.Response
+//	@Router		/api/v1/folders/originals [get]
+func SearchFoldersOriginals(router *gin.RouterGroup) {
+	conf := get.Config()
+	SearchFolders(router, "originals", entity.RootOriginals, conf.OriginalsPath())
+}
+
+// SearchFoldersImport returns import folders as JSON.
+//
+//	@Summary	list folders in import
+//	@Id			SearchFoldersImport
+//	@Tags		Folders
+//	@Produce	json
+//	@Success	200		{object}	api.FoldersResponse
+//	@Header		200		{number}	X-Folders	"The actual number of folders returned.  Do not use for determining if all the results have been returned."
+//	@Header		200		{number}	X-Files		"The actual number of files returned.  Use this for comparing to X-Limit to determine if all the results have been returned."
+//	@Header		200		{number}	X-Count		"The actual number of files and folders returned.  Do not use for determining if all the results have been returned."
+//	@Header		200		{number}	X-Limit		"The limit of the number of files to be returned"
+//	@Header		200		{number}	X-Offset	"The offset that was used"
+//	@Failure	401,403	{object}	i18n.Response
+//	@Router		/api/v1/folders/import [get]
+func SearchFoldersImport(router *gin.RouterGroup) {
+	conf := get.Config()
+	SearchFolders(router, "import", entity.RootImport, conf.ImportPath())
+}
+
+// SearchFolders is a reusable request handler for directory listings (GET /api/v1/folders/*).
+func SearchFolders(router *gin.RouterGroup, urlPath, rootName, rootPath string) {
+	handler := func(c *gin.Context) {
+		// A directory listing names every file in the library, private pictures included, so it
+		// asks for whole-library access rather than library reach alone - no less than the File
+		// Browser, Index and Import pages require before they render it.
+		s := Auth(c, acl.ResourceFiles, acl.AccessAll)
+
+		// Abort if permission is not granted.
+		if s.Abort(c) {
+			return
+		}
+
+		var frm form.SearchFolders
+
+		start := time.Now()
+		err := c.MustBindWith(&frm, binding.Form)
+
+		if err != nil {
+			AbortBadRequest(c, err)
+			return
+		}
+
+		// Exclude private content? Evaluated on the session's effective role: for a client session,
+		// the intersection of the client and user roles.
+		if !get.Config().Settings().Features.Private {
+			frm.Public = false
+		} else if s.Denies(acl.ResourcePhotos, acl.AccessPrivate) {
+			frm.Public = true
+		}
+
+		cache := get.FolderCache()
+		recursive := frm.Recursive
+		listFiles := frm.Files
+		uncached := listFiles || frm.Uncached
+		resp := FoldersResponse{Root: rootName, Recursive: recursive, Cached: !uncached}
+		path := clean.UserPath(c.Param("path"))
+
+		cacheKey := fmt.Sprintf("folder:%s:%t:%t:%t", filepath.Join(rootName, path), recursive, listFiles, frm.Public)
+
+		if !uncached {
+			if cacheData, ok := cache.Get(cacheKey); ok {
+				cached := cacheData.(FoldersResponse)
+
+				log.Tracef("api: cache hit for %s [%s]", clean.Log(cacheKey), time.Since(start))
+
+				c.JSON(http.StatusOK, cached)
+				return
+			}
+		}
+
+		if folders, err := query.FoldersByPath(rootName, rootPath, path, recursive); err != nil {
+			log.Errorf("folder: %s", clean.Error(err))
+			c.JSON(http.StatusOK, resp)
+			return
+		} else {
+			resp.Folders = folders
+		}
+
+		if listFiles {
+			if files, err := query.FilesByPath(frm.Count, frm.Offset, rootName, path, frm.Public); err != nil {
+				log.Errorf("folder: %s", clean.Error(err))
+			} else {
+				resp.Files = files
+			}
+		}
+
+		if !uncached {
+			cache.SetDefault(cacheKey, resp)
+			log.Debugf("cached %s [%s]", clean.Log(cacheKey), time.Since(start))
+		}
+
+		AddFileCountHeaders(c, len(resp.Files), len(resp.Folders))
+		AddCountHeader(c, len(resp.Files)+len(resp.Folders))
+		AddLimitHeader(c, frm.Count)
+		AddOffsetHeader(c, frm.Offset)
+		AddTokenHeaders(c, s)
+
+		c.JSON(http.StatusOK, resp)
+	}
+
+	router.GET("/folders/"+urlPath, handler)
+	router.GET("/folders/"+urlPath+"/*path", handler)
+}
