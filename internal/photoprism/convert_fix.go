@@ -1,0 +1,113 @@
+package photoprism
+
+import (
+	"bytes"
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"time"
+
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/proc"
+)
+
+// FixJpeg tries to re-encode a broken JPEG and returns the cached image file.
+func (w *Convert) FixJpeg(f *MediaFile, force bool) (*MediaFile, error) {
+	if f == nil {
+		return nil, fmt.Errorf("convert: no media file provided for processing - you may have found a bug")
+	}
+
+	logName := clean.Log(f.RootRelName())
+
+	if w.conf.DisableImageMagick() || !w.imageMagickExclude.Allow(fs.ExtJpeg) {
+		return nil, fmt.Errorf("convert: ImageMagick must be enabled to re-encode %s", logName)
+	}
+
+	switch {
+	case !f.Exists():
+		return nil, fmt.Errorf("convert: %s not found", logName)
+	case f.Empty():
+		return nil, fmt.Errorf("convert: %s is empty", logName)
+	case !f.IsJpeg():
+		return nil, fmt.Errorf("convert: %s is not a jpeg", logName)
+	}
+
+	var err error
+
+	// Get SHA1 file hash.
+	fileHash := f.Hash()
+
+	// Get cache path based on config and file hash.
+	cacheDir := w.conf.MediaFileCachePath(fileHash)
+
+	// Compose cache filename.
+	cacheName := filepath.Join(cacheDir, fileHash+fs.ExtJpeg)
+
+	mediaFile, err := NewMediaFile(cacheName)
+
+	// Replace existing sidecar if "force" is true.
+	if err == nil && mediaFile.IsJpeg() {
+		if force && mediaFile.InSidecar() {
+			if err := mediaFile.Remove(); err != nil {
+				return mediaFile, fmt.Errorf("convert: failed removing re-encoded copy of %s (%w)", logName, err)
+			} else {
+				log.Infof("convert: replacing re-encoded copy of %s", logName)
+			}
+		} else {
+			return mediaFile, nil
+		}
+	}
+
+	fileName := f.RelName(w.conf.OriginalsPath())
+
+	// Publish file conversion event.
+	publishConverting(f, fileName, "")
+
+	start := time.Now()
+
+	// Try ImageMagick for other image file formats if allowed.
+	quality := fmt.Sprintf("%d", w.conf.JpegQuality())
+	resize := fmt.Sprintf("%dx%d>", w.conf.JpegSize(), w.conf.JpegSize())
+	args := []string{f.FileName(), "-flatten", "-resize", resize, "-quality", quality, cacheName}
+	// #nosec G204 -- command is constructed from validated config and media file paths.
+	cmd := exec.Command(w.conf.ImageMagickBin(), args...)
+
+	if fs.FileExists(cacheName) {
+		return NewMediaFile(cacheName)
+	}
+
+	// Fetch command output.
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	cmd.Env = append(cmd.Env, []string{
+		fmt.Sprintf("HOME=%s", w.conf.CmdCachePath()),
+		fmt.Sprintf("LD_LIBRARY_PATH=%s", w.conf.CmdLibPath()),
+	}...)
+
+	log.Infof("convert: re-encoding %s (%s)", logName, filepath.Base(cmd.Path))
+
+	// Log exact command for debugging in trace mode.
+	log.Trace(clean.Cmd(cmd))
+
+	// Run convert command.
+	if err = proc.Run(cmd, w.conf.ConvertTimeout()); err != nil {
+		if s := stderr.String(); s != "" {
+			err = fmt.Errorf("%w: %s", err, s)
+		}
+
+		LogConvertError(err, cmd, logName)
+		RemoveConvertOutput(cacheName, cmd)
+	} else if fs.FileExistsNotEmpty(cacheName) {
+		log.Infof("convert: %s re-encoded in %s (%s)", logName, time.Since(start), filepath.Base(cmd.Path))
+	}
+
+	// Ok?
+	if err != nil {
+		return nil, err
+	}
+
+	return NewMediaFile(cacheName)
+}

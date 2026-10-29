@@ -1,0 +1,129 @@
+package photoprism
+
+import (
+	"fmt"
+	"path"
+	"path/filepath"
+
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/pkg/fs"
+)
+
+// FileName returns the full file name based on the root folder type.
+func FileName(fileRoot, fileName string) string {
+	return ConfigFileName(Config(), fileRoot, fileName)
+}
+
+// ConfigFileName returns the full file name based on the root folder type, resolved
+// against the specified configuration rather than the process-wide one.
+func ConfigFileName(conf *config.Config, fileRoot, fileName string) string {
+	if conf == nil {
+		return fileName
+	}
+
+	switch fileRoot {
+	case entity.RootSidecar:
+		return path.Join(conf.SidecarPath(), fileName)
+	case entity.RootImport:
+		return path.Join(conf.ImportPath(), fileName)
+	case entity.RootSamples:
+		return path.Join(conf.SamplesPath(), fileName)
+	default:
+		return path.Join(conf.OriginalsPath(), fileName)
+	}
+}
+
+// CachePath returns a cache directory name based on the base path, file hash and cache namespace.
+func CachePath(fileHash, namespace string) (cachePath string, err error) {
+	return fs.CachePath(Config().CachePath(), fileHash, namespace, true)
+}
+
+// CacheName returns an absolute cache file name based on the base path, file hash and cache namespace.
+func CacheName(fileHash, namespace, cacheKey string) (cacheName string, err error) {
+	if cacheKey == "" {
+		return "", fmt.Errorf("cache: key for hash '%s' is empty", fileHash)
+	}
+
+	cachePath, err := CachePath(fileHash, namespace)
+
+	if err != nil {
+		return "", err
+	}
+
+	cacheName = filepath.Join(cachePath, fmt.Sprintf("%s_%s", fileHash, cacheKey))
+
+	return cacheName, nil
+}
+
+// ExifToolCacheName returns the ExifTool metadata cache file name.
+func ExifToolCacheName(hash string) (string, error) {
+	return CacheName(hash, "json", "exiftool.json")
+}
+
+// RelName returns the relative filename.
+func RelName(fileName, directory string) string {
+	return fs.RelName(fileName, directory)
+}
+
+// RootPath returns the file root path based on the configuration.
+func RootPath(fileName string) string {
+	switch Root(fileName) {
+	case entity.RootSidecar:
+		return Config().SidecarPath()
+	case entity.RootImport:
+		return Config().ImportPath()
+	case entity.RootSamples:
+		return Config().SamplesPath()
+	default:
+		return Config().OriginalsPath()
+	}
+}
+
+// Root returns the file root directory.
+func Root(fileName string) string {
+	originalsPath := Config().OriginalsPath()
+
+	if originalsPath != "" && fs.InDir(fileName, originalsPath) {
+		return entity.RootOriginals
+	}
+
+	importPath := Config().ImportPath()
+
+	if importPath != "" && fs.InDir(fileName, importPath) {
+		return entity.RootImport
+	}
+
+	sidecarPath := Config().SidecarPath()
+
+	if sidecarPath != "" && fs.InDir(fileName, sidecarPath) {
+		return entity.RootSidecar
+	}
+
+	samplesPath := Config().SamplesPath()
+
+	if samplesPath != "" && fs.InDir(fileName, samplesPath) {
+		return entity.RootSamples
+	}
+
+	return entity.RootUnknown
+}
+
+// RootRelName returns the relative filename, and automatically detects the root path.
+func RootRelName(fileName string) string {
+	return RelName(fileName, RootPath(fileName))
+}
+
+// displayFolder returns the name of a folder relative to its base folder, "/" for the base folder itself, or
+// its base name if it has no base folder, so notifications do not show the storage path.
+func displayFolder(folder, base string) string {
+	folder = filepath.Clean(folder)
+
+	if base == "" || !fs.InDir(folder, base) {
+		return filepath.Base(folder)
+	} else if rel := fs.RelName(folder, base); rel != "" {
+		return rel
+	}
+
+	return "/"
+}

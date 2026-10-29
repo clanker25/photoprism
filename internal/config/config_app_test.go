@@ -1,0 +1,174 @@
+package config
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/photoprism/photoprism/internal/config/pwa"
+)
+
+func TestConfig_AppName(t *testing.T) {
+	c := NewConfig(CliTestContext())
+	assert.Equal(t, "PhotoPrism", c.AppName())
+	t.Run("ExplicitAppNameWins", func(t *testing.T) {
+		c.options.AppName = "My App"
+		c.options.SiteName = "Acme Media"
+		c.options.SiteTitle = "Our Trip"
+		assert.Equal(t, "My App", c.AppName())
+	})
+	t.Run("PrefersSiteNameOverSiteTitle", func(t *testing.T) {
+		c.options.AppName = ""
+		c.options.SiteName = "Acme Media"
+		c.options.SiteTitle = "Our Trip"
+		assert.Equal(t, "Acme Media", c.AppName())
+	})
+	t.Run("FallsBackToSiteTitle", func(t *testing.T) {
+		c.options.AppName = ""
+		c.options.SiteName = ""
+		c.options.SiteTitle = "Our Trip"
+		assert.Equal(t, "Our Trip", c.AppName())
+	})
+	t.Run("StripsQuotesAndClips", func(t *testing.T) {
+		c.options.AppName = `A'B"C`
+		assert.Equal(t, "ABC", c.AppName())
+	})
+	c.options.AppName = ""
+	c.options.SiteName = ""
+	c.options.SiteTitle = ""
+}
+
+func TestConfig_AppMode(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "standalone", c.AppMode())
+}
+
+func TestConfig_AppIcon(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, "logo", c.AppIcon())
+	c.options.AppIcon = "foo"
+	assert.Equal(t, "logo", c.AppIcon())
+	c.options.AppIcon = "app"
+	assert.Equal(t, "app", c.AppIcon())
+	c.options.AppIcon = "crisp"
+	assert.Equal(t, "crisp", c.AppIcon())
+	c.options.AppIcon = "mint"
+	assert.Equal(t, "mint", c.AppIcon())
+	c.options.AppIcon = "bold"
+	assert.Equal(t, "bold", c.AppIcon())
+	c.options.AppIcon = "bloom"
+	assert.Equal(t, "bloom", c.AppIcon())
+	c.options.AppIcon = "flower"
+	assert.Equal(t, "flower", c.AppIcon())
+	c.options.AppIcon = "ring"
+	assert.Equal(t, "ring", c.AppIcon())
+	c.options.AppIcon = "rainbow"
+	assert.Equal(t, "rainbow", c.AppIcon())
+	c.options.AppIcon = "logo"
+	assert.Equal(t, "logo", c.AppIcon())
+}
+
+func TestConfig_AppTouchIcon(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	// Every built-in set (default, round, and squircle) resolves to its full-bleed touch variant.
+	assert.Equal(t, "logo/touch", c.AppTouchIcon())
+	c.options.AppIcon = "foo"
+	assert.Equal(t, "logo/touch", c.AppTouchIcon())
+	c.options.AppIcon = "logo"
+	assert.Equal(t, "logo/touch", c.AppTouchIcon())
+	c.options.AppIcon = "neon"
+	assert.Equal(t, "neon/touch", c.AppTouchIcon())
+	c.options.AppIcon = "crisp"
+	assert.Equal(t, "crisp/touch", c.AppTouchIcon())
+	c.options.AppIcon = "glass"
+	assert.Equal(t, "glass/touch", c.AppTouchIcon())
+	c.options.AppIcon = "app"
+	assert.Equal(t, "app/touch", c.AppTouchIcon())
+	c.options.AppIcon = "rainbow"
+	assert.Equal(t, "rainbow/touch", c.AppTouchIcon())
+	// Custom theme/URL icons have no touch variant, so they fall back to the "app" touch squircle
+	// instead of producing broken apple-touch-icon links.
+	c.options.AppIcon = "/custom/logo.png"
+	assert.Equal(t, "app/touch", c.AppTouchIcon())
+	c.options.AppIcon = "https://cdn.example.com/logo.png"
+	assert.Equal(t, "app/touch", c.AppTouchIcon())
+}
+
+func TestConfig_AppColor(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	assert.Equal(t, DefaultAppColor, c.AppColor())
+	c.options.AppColor = "#aBC123"
+	assert.Equal(t, "#abc123", c.AppColor())
+	c.options.AppColor = "#000000"
+	assert.Equal(t, "#000000", c.AppColor())
+	c.options.AppColor = ""
+	assert.Equal(t, DefaultAppColor, c.AppColor())
+}
+
+func TestConfig_AppIconsPath(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	if p := c.AppIconsPath(); !strings.HasSuffix(p, "photoprism/assets/static/icons") {
+		t.Fatal("path .../photoprism/assets/static/icons expected")
+	}
+
+	if p := c.AppIconsPath("app"); !strings.HasSuffix(p, "photoprism/assets/static/icons/app") {
+		t.Fatal("path .../photoprism/assets/static/icons/app expected")
+	}
+
+	if p := c.AppIconsPath("app", "512.png"); !strings.HasSuffix(p, "photoprism/assets/static/icons/app/512.png") {
+		t.Fatal("path .../photoprism/assets/static/icons/app/512.png expected")
+	}
+}
+
+func TestConfig_AppConfig(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	result := c.AppConfig()
+	assert.NotEmpty(t, result)
+	assert.Equal(t, c.AppName(), result.Name)
+	assert.Equal(t, c.AppIcon(), result.Icon)
+	assert.Equal(t, c.SiteDescription(), result.Description)
+	assert.Equal(t, c.BaseUri("/"), result.BaseUri)
+	assert.Equal(t, c.FrontendUri(""), result.FrontendUri)
+	assert.Equal(t, c.StaticUri(), result.StaticUri)
+}
+
+func TestConfig_AppManifest(t *testing.T) {
+	c := NewConfig(CliTestContext())
+
+	appConf := c.AppConfig()
+	assert.NotEmpty(t, appConf)
+
+	t.Run("Cached", func(t *testing.T) {
+		result := c.AppManifest()
+		assert.NotEmpty(t, result)
+		assert.Equal(t, appConf.Name, result.Name)
+		assert.Equal(t, appConf.Name, result.ShortName)
+		assert.Equal(t, appConf.Description, result.Description)
+		assert.Equal(t, appConf.BaseUri, result.Scope)
+		assert.Equal(t, pwa.StartUrl(appConf.BaseUri, appConf.FrontendUri), result.StartUrl)
+		assert.Len(t, result.Icons, len(pwa.IconSizes)+len(pwa.MaskableIconSizes))
+		assert.Len(t, result.Categories, len(pwa.Categories))
+		assert.Len(t, result.Permissions, len(pwa.Permissions))
+		assert.NotEmpty(t, result.Lang)
+		assert.NotEmpty(t, result.Dir)
+		assert.Len(t, result.Screenshots, 2)
+
+		cached := c.AppManifest()
+		assert.NotEmpty(t, cached)
+		assert.Equal(t, appConf.Name, cached.Name)
+		assert.Equal(t, appConf.Name, cached.ShortName)
+		assert.Equal(t, appConf.Description, cached.Description)
+		assert.Equal(t, appConf.BaseUri, cached.Scope)
+		assert.Equal(t, pwa.StartUrl(appConf.BaseUri, appConf.FrontendUri), cached.StartUrl)
+		assert.Len(t, cached.Icons, len(pwa.IconSizes)+len(pwa.MaskableIconSizes))
+		assert.Len(t, cached.Categories, len(pwa.Categories))
+		assert.Len(t, cached.Permissions, len(pwa.Permissions))
+	})
+}

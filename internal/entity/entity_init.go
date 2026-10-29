@@ -1,0 +1,105 @@
+package entity
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/photoprism/photoprism/internal/entity/migrate"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/dsn"
+	"github.com/photoprism/photoprism/pkg/fs"
+)
+
+// onReady stores callbacks to execute once database initialization finishes.
+var onReady []func()
+
+// ready executes all registered callbacks after database initialization completes.
+func ready() {
+	for _, init := range onReady {
+		init()
+	}
+}
+
+// InitDb creates database tables and inserts default fixtures as needed, and returns an error if the
+// schema could not be migrated.
+func InitDb(opt migrate.Options) (err error) {
+	if !HasDbProvider() {
+		log.Error("migrate: no database provider")
+		return fmt.Errorf("migrate: no database provider")
+	}
+
+	start := time.Now()
+
+	if opt.DropDeprecated {
+		DeprecatedTables.Drop(Db())
+	}
+
+	err = Entities.Migrate(Db(), opt)
+
+	// The error is returned, so the caller reports it.
+	if waitErr := Entities.WaitForMigration(Db()); waitErr != nil {
+		if err == nil {
+			err = waitErr
+		}
+	}
+
+	// After a failed migration, default fixtures are created only if their tables exist.
+	if err == nil || hasDefaultFixtureTables(Db()) {
+		CreateDefaultFixtures()
+	}
+
+	ready()
+
+	log.Debugf("migrate: completed in %s", time.Since(start))
+
+	return err
+}
+
+// InitTestDb connects to and completely initializes the test database incl fixtures.
+func InitTestDb(driver, dbDsn string) *DbConn {
+	if HasDbProvider() {
+		return nil
+	}
+
+	start := time.Now()
+
+	// Set default test database driver.
+	if driver == "test" || driver == "sqlite" || driver == "" || dbDsn == "" {
+		driver = dsn.DriverSQLite3
+	}
+
+	// Set default database DSN.
+	if driver == dsn.DriverSQLite3 {
+		if dbDsn == "" || dbDsn == dsn.SQLiteTestDB {
+			dbDsn = dsn.SQLiteTestDB
+			if !fs.FileExists(dbDsn) {
+				log.Debugf("sqlite: test database %s does not already exist", clean.Log(dbDsn))
+			} else if err := os.Remove(dbDsn); err != nil {
+				log.Errorf("sqlite: failed to remove existing test database %s (%s)", clean.Log(dbDsn), err)
+			}
+		}
+	}
+
+	// Give the package a database of its own, so that tests can run in parallel.
+	dbDsn = TestDbDSN(driver, dbDsn)
+
+	log.Infof("initializing %s test db in %s", driver, dsn.Mask(dbDsn))
+
+	// Create gorm.DB connection provider.
+	db := &DbConn{
+		Driver: driver,
+		Dsn:    dbDsn,
+	}
+
+	// Insert test fixtures into the database.
+	SetDbProvider(db)
+	ResetTestFixtures()
+	File{}.RegenerateIndex()
+
+	ready()
+
+	log.Debugf("migrate: completed in %s", time.Since(start))
+
+	return db
+}

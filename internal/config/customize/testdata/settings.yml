@@ -1,0 +1,86 @@
+UI:
+  Scrollbar: true
+  Zoom: false
+  OpenOnHover: true
+  ReduceMotion: true
+  Theme: onyx
+  Language: de
+  TimeZone: Local
+  StartPage: default
+Search:
+  BatchSize: -1
+  ListView: true
+  ShowTitles: true
+  ShowCaptions: true
+Maps:
+  Animate: 1
+  Style: default
+Features:
+  Albums: true
+  Archive: true
+  Delete: false
+  Download: true
+  Export: false
+  Edit: true
+  BatchEdit: true
+  Estimates: true
+  Favorites: false
+  Files: false
+  Folders: true
+  Import: true
+  Labels: true
+  Cameras: true
+  Lenses: true
+  Library: true
+  Logs: true
+  Calendar: true
+  Moments: true
+  People: false
+  Places: true
+  Private: false
+  Ratings: false
+  Reactions: true
+  Review: true
+  Search: true
+  Services: true
+  Account: true
+  AppPasswords: true
+  Settings: true
+  Share: false
+  Upload: true
+  Videos: true
+Import:
+  Path: /
+  Move: false
+Index:
+  Path: /
+  Convert: true
+  Rescan: false
+  SkipArchived: false
+Stack:
+  UUID: false
+  Meta: true
+  Name: true
+Share:
+  Title: ""
+Download:
+  Name: file
+  Disabled: false
+  Originals: true
+  MediaRaw: false
+  MediaSidecar: true
+Albums:
+  Download:
+    Name: share
+    Disabled: false
+    Originals: true
+    MediaRaw: true
+    MediaSidecar: false
+  Order:
+    Album: oldest
+    Folder: added
+    Moment: oldest
+    State: newest
+    Month: oldest
+Templates:
+  Default: index.gohtml
